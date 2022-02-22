@@ -14,6 +14,7 @@ import (
 type scanIterator struct {
 	ddbClient *dynamodb.DynamoDB
 	tableName string
+	indexName string
 	segments  int
 	keysOnly  bool
 
@@ -45,6 +46,10 @@ func (s *scanIterator) worker(ctx context.Context, segment int64, totalSegments 
 			Segment:           &segment,
 			TotalSegments:     &totalSegments,
 			ExclusiveStartKey: exclusiveStartKey,
+		}
+
+		if s.indexName != "" {
+			req.IndexName = &s.indexName
 		}
 
 		if s.keysOnly {

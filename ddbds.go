@@ -2,6 +2,7 @@ package ddbds
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -13,21 +14,23 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
+	golog "github.com/ipfs/go-log/v2"
+	"go.uber.org/zap"
 )
 
-// we leave 10,000 bytes for the item metadata (e.g. the key, prefixes, etc.)
 const (
-	maxValueBytes = 390_000
-
 	attrNameKey        = "Key"
 	attrNameSize       = "Size"
 	attrNameExpiration = "Expiration"
 )
 
+var log = golog.Logger("ddbds")
+
 type Options struct {
 	UseStronglyConsistentReads bool
 	ScanParallelism            int
 	KeyTransforms              []KeyTransform
+	DisableTableScans          bool
 }
 
 func WithStronglyConsistentReads() func(o *Options) {
@@ -48,6 +51,12 @@ func WithKeyTransform(k KeyTransform) func(o *Options) {
 	}
 }
 
+func WithDisableTableScans() func(o *Options) {
+	return func(o *Options) {
+		o.DisableTableScans = true
+	}
+}
+
 func New(ddbClient *dynamodb.DynamoDB, table string, optFns ...func(o *Options)) (*ddbDatastore, error) {
 	opts := Options{}
 	for _, o := range optFns {
@@ -60,6 +69,7 @@ func New(ddbClient *dynamodb.DynamoDB, table string, optFns ...func(o *Options))
 		useStronglyConsistentReads: opts.UseStronglyConsistentReads,
 		keyTransforms:              opts.KeyTransforms,
 		table:                      table,
+		disableTableScans:          opts.DisableTableScans,
 	}
 
 	if ddbDS.ScanParallelism == 0 {
@@ -86,6 +96,8 @@ type ddbDatastore struct {
 	// For example, if you have a prefix on /foo and /foo/bar, then /foo/bar should be before /foo
 	// in this slice, so that queries for /foo/bar/baz use the /foo/bar index and not the /foo index.
 	keyTransforms []KeyTransform
+
+	disableTableScans bool
 }
 
 var _ ds.Datastore = (*ddbDatastore)(nil)
@@ -134,7 +146,7 @@ func (d *ddbDatastore) makePutKey(key ds.Key) Key {
 
 	// add any additional index keys
 	for _, transform := range d.keyTransforms {
-		transformKey, ok := transform.Key(key)
+		transformKey, ok := transform.PutKey(key)
 		if !ok {
 			// TODO metric?
 			continue
@@ -225,6 +237,9 @@ func (d *ddbDatastore) put(ctx context.Context, key ds.Key, value []byte, ttl ti
 	for k, v := range k.Attrs {
 		req.Item[k] = v
 	}
+
+	log.Debug("putting item", zap.Reflect("item", req.Item))
+
 	_, err = d.ddbClient.PutItemWithContext(ctx, req)
 
 	if err != nil {
@@ -271,39 +286,77 @@ func (d *ddbDatastore) Query(ctx context.Context, q query.Query) (query.Results,
 		if !ok {
 			continue
 		}
-		// if the prefix matches, then it is used as the partition key of a query on the specified index
-		ddbQuery := &dynamodb.QueryInput{
-			TableName:                 &d.table,
-			IndexName:                 &transform.Index,
-			KeyConditionExpression:    aws.String(fmt.Sprintf("#k = :v")),
-			ExpressionAttributeNames:  map[string]*string{"#k": &k.PartitionKeyName},
-			ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{":v": {S: &q.Prefix}},
-			ConsistentRead:            aws.Bool(d.useStronglyConsistentReads),
-		}
 
-		// we can only do this with queries and if there is exactly one order,
-		// otherwise we have to do the sorting client-side
-		if len(q.Orders) == 1 {
-			if _, ok := q.Orders[0].(*query.OrderByKeyDescending); ok {
-				ddbQuery.ScanIndexForward = aws.Bool(false)
-				useNaiveOrders = false
+		// if there's a matching partition key and a query index, then we query
+		// else, if there's a scan index, we scan
+		// if neither of these hold, then we can't do anything, so we skip this transform and continue with the rest
+		log.Debugw("got key from key transform", "key", k)
+		if transform.QueryIndex != "" && k.Attrs[k.PartitionKeyName] != nil {
+			log.Debugw("querying", "QueryIndex", transform.QueryIndex, "key", k)
+			if transform.disableQueries {
+				return nil, fmt.Errorf("queries on '%s' are disabled", transform.QueryIndex)
 			}
-		}
 
-		queryIter := newQueryIterator(d.ddbClient, ddbQuery, q.KeysOnly)
-		queryIter.start(ctx)
-		results = query.ResultsFromIterator(q, query.Iterator{
-			Next:  queryIter.Next,
-			Close: queryIter.Close,
-		})
+			partitionKeyValue := *k.Attrs[k.PartitionKeyName].S
+			ddbQuery := &dynamodb.QueryInput{
+				TableName:                 &d.table,
+				IndexName:                 &transform.QueryIndex,
+				KeyConditionExpression:    aws.String(fmt.Sprintf("#k = :v")),
+				ExpressionAttributeNames:  map[string]*string{"#k": &k.PartitionKeyName},
+				ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{":v": {S: &partitionKeyValue}},
+			}
+
+			// we can only do this with queries and if there is exactly one order,
+			// otherwise we have to do the sorting client-side
+			if len(q.Orders) == 1 {
+				if _, ok := q.Orders[0].(*query.OrderByKeyDescending); ok {
+					ddbQuery.ScanIndexForward = aws.Bool(false)
+					useNaiveOrders = false
+				}
+			}
+
+			queryIter := newQueryIterator(d.ddbClient, ddbQuery, q.KeysOnly)
+			queryIter.start(ctx)
+			results = query.ResultsFromIterator(q, query.Iterator{
+				Next:  queryIter.Next,
+				Close: queryIter.Close,
+			})
+		} else if transform.ScanIndex != "" {
+			log.Debugw("scanning", "ScanIndex", transform.ScanIndex, "key", k)
+			if transform.disableScans {
+				return nil, fmt.Errorf("scans on '%s' are disabled", transform.ScanIndex)
+			}
+			if transform.ScanParallelism == 0 {
+				return nil, fmt.Errorf("cannot scan '%s' for datastore query since ScanParallelism=0", transform.ScanIndex)
+			}
+
+			scanIter := &scanIterator{
+				ddbClient: d.ddbClient,
+				indexName: transform.ScanIndex,
+				tableName: d.table,
+				segments:  d.ScanParallelism,
+				keysOnly:  q.KeysOnly,
+			}
+			scanIter.start(ctx)
+			results = query.ResultsFromIterator(q, query.Iterator{
+				Next:  scanIter.Next,
+				Close: scanIter.Close,
+			})
+		} else {
+			log.Debugw("couldn't query nor scan, passing", "Prefix", transform.Prefix)
+			continue
+		}
 
 		break
 	}
 
-	// if we don't find one, we fall back to a scan
+	// if no transforms matched, then scan the whole table
 	if results == nil {
 		if d.ScanParallelism == 0 {
-			return nil, fmt.Errorf("cannot scan DynamoDB table for datastore query since scanning is disabled, try increasing scan parallelism or adding query prefixes")
+			return nil, errors.New("cannot scan DynamoDB table for datastore query since scanning is disabled, try increasing scan parallelism or adding key transforms")
+		}
+		if d.disableTableScans {
+			return nil, errors.New("table scans are disabled")
 		}
 
 		scanIter := &scanIterator{

@@ -35,19 +35,9 @@ func (q *queryIterator) start(ctx context.Context) {
 		defer close(q.resultChan)
 		defer q.cancel()
 
-		//		fmt.Printf("starting query\n")
-		// b, err := json.MarshalIndent(q.ddbQuery, "", "  ")
-		// if err != nil {
-		// 	panic(err)
-		// }
-		//		fmt.Println(string(b))
-
 		err := q.ddbClient.QueryPagesWithContext(ctx, q.ddbQuery, func(page *dynamodb.QueryOutput, morePages bool) bool {
-			//			fmt.Printf("got %d results in a page\n", len(page.Items))
 			for _, itemMap := range page.Items {
-				//				fmt.Printf("got an item\n")
 				result := itemMapToQueryResult(itemMap, q.keysOnly)
-
 				select {
 				case <-ctx.Done():
 					return false
@@ -72,7 +62,6 @@ func (q *queryIterator) start(ctx context.Context) {
 
 func (q *queryIterator) Next() (query.Result, bool) {
 	res, ok := <-q.resultChan
-	//	fmt.Printf("got %v %v\n", res, ok)
 	return res, ok
 }
 
