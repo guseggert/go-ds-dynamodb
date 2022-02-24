@@ -3,6 +3,7 @@ package ddbds
 import (
 	"strings"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	ds "github.com/ipfs/go-datastore"
 )
@@ -10,11 +11,14 @@ import (
 // Key describes the key schema for a DynamoDB item for a datastore entry.
 // This is used for gets and puts on the table.
 type Key struct {
+	Table string
+
 	// Attrs are the key attributes. It contains either the partition key or both the partition key and the sort key.
 	// It also contains any additional index keys.
 	Attrs            map[string]*dynamodb.AttributeValue
 	PartitionKeyName string
 	SortKeyName      string
+	ShouldQuery      bool
 
 	disableScan  bool
 	disableQuery bool
@@ -23,15 +27,15 @@ type Key struct {
 type KeyTransform struct {
 	Prefix string
 
-	// If you want to always scan the index instead of query,
-	// then don't include a QueryIndex
-	ScanIndex       string
+	UseStronglyConsistentReads bool
+
+	Table string
+
 	ScanParallelism int
 
-	QueryIndex string
-
 	PartitionKeyName string
-	SortKeyName      string
+	// Sort key is optional, if unspecified then all matching queries will result in scans.
+	SortKeyName string
 
 	// used for testing
 	disableScans   bool
@@ -60,23 +64,34 @@ func (p *KeyTransform) QueryKey(queryPrefix string) (Key, bool) {
 		return Key{}, false
 	}
 
+	// note that if QueryPrefix="" (i.e. no prefix was specified), then it's effectively
+	// the same as QueryPrefix="/"
+
+	// // if TransformPrefix=/foo/bar and QueryPrefix=/foo/bar, there is not a case where the
+	// // transform prefix is usable for that scenario
+	// // but TransformPrefix=/ and QueryPrefix=/ is a special case
+	// if len(trimmed) == 0 {
+	// 	return Key{}, false
+	// }
+
 	log.Debugw("trimmed query key", "QueryPrefixNS", queryPrefixNamespaces, "TransformPrefixNS", transformPrefixNamespaces, "Trimmed", trimmed)
 
-	attrs := map[string]*dynamodb.AttributeValue{}
-
-	// we query only if len(trimmed)==1, otherwise we scan
-	if len(trimmed) == 1 {
-		partitionKey := trimmed[0]
-		attrs[p.PartitionKeyName] = &dynamodb.AttributeValue{S: &partitionKey}
-	}
-
-	return Key{
-		Attrs:            attrs,
+	key := Key{
+		Attrs:            map[string]*dynamodb.AttributeValue{},
 		PartitionKeyName: p.PartitionKeyName,
 		SortKeyName:      p.SortKeyName,
 		disableScan:      p.disableScans,
 		disableQuery:     p.disableQueries,
-	}, true
+	}
+
+	// we query only if len(trimmed)==1, otherwise we scan
+	if len(trimmed) == 1 {
+		partitionKey := trimmed[0]
+		key.Attrs[p.PartitionKeyName] = &dynamodb.AttributeValue{S: &partitionKey}
+		key.ShouldQuery = true
+	}
+
+	return key, true
 }
 
 func (p *KeyTransform) PutKey(key ds.Key) (Key, bool) {
@@ -89,28 +104,33 @@ func (p *KeyTransform) PutKey(key ds.Key) (Key, bool) {
 	}
 	log.Debugw("trimmed put key", "TrimmedKey", trimmed)
 
-	attrs := map[string]*dynamodb.AttributeValue{}
+	attrs := map[string]*dynamodb.AttributeValue{
+		attrNameKey: {S: aws.String(key.String())},
+	}
 
 	if p.SortKeyName == "" {
 		partitionKey := strings.Join(trimmed, "/")
 		attrs[p.PartitionKeyName] = &dynamodb.AttributeValue{S: &partitionKey}
 	} else {
 		// if there's a sort key, then the first element of the trimmed key is the partition key
-		// and the rest of the trimmed key, if it exists, is the sort key
+		// and the rest of the trimmed key is the sort key
+
+		// there need to be >= 2 elements in the trimmed key so we can derive a sort key
+		// otherwise we can't write to this table
+		if len(trimmed) < 2 {
+			return Key{}, false
+		}
+
 		partitionKey := trimmed[0]
 		attrs[p.PartitionKeyName] = &dynamodb.AttributeValue{S: &partitionKey}
 
-		// after trimming prefix, if len >= 2, then set the sort key as well
-		// this will populate both the query and scan indices with this entry
-		if len(trimmed) >= 2 {
-			// query index, add the sort key
-			sortKeyNamespaces := trimmed[1:]
-			sortKey := strings.Join(sortKeyNamespaces, "/")
-			attrs[p.SortKeyName] = &dynamodb.AttributeValue{S: &sortKey}
-		}
+		sortKeyNamespaces := trimmed[1:]
+		sortKey := strings.Join(sortKeyNamespaces, "/")
+		attrs[p.SortKeyName] = &dynamodb.AttributeValue{S: &sortKey}
 	}
 
 	return Key{
+		Table:            p.Table,
 		Attrs:            attrs,
 		PartitionKeyName: p.PartitionKeyName,
 		SortKeyName:      p.SortKeyName,

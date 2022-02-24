@@ -1,8 +1,11 @@
 package ddbds
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,11 +27,12 @@ import (
 var (
 	tableName = "testtable"
 	bucket    = "testbucket"
+
+	logLevel = golog.LevelInfo
 )
 
 func init() {
-	//	golog.SetDebugLogging()
-	golog.SetAllLoggers(golog.LevelInfo)
+	golog.SetAllLoggers(logLevel)
 }
 
 func startLocalstack() (*localstack.Instance, func()) {
@@ -49,6 +53,43 @@ func startLocalstack() (*localstack.Instance, func()) {
 			log.Errorw("error shutting down localstack instance", "Error", err.Error())
 		}
 	}
+}
+
+func startDDBLocal(ctx context.Context, ddbClient *dynamodb.DynamoDB) (func(), error) {
+	cmd := exec.Command("docker", "run", "-d", "-p", "8000:8000", "amazon/dynamodb-local", "-jar", "DynamoDBLocal.jar", "-inMemory")
+	buf := &bytes.Buffer{}
+	cmd.Stdout = buf
+	cmd.Stderr = buf
+	err := cmd.Run()
+	if err != nil {
+		return nil, fmt.Errorf("error running DynamoDB Local (%s), output:\n%s", err.Error(), buf)
+	}
+
+	ctrID := strings.TrimSpace(buf.String())
+
+	cleanupFunc := func() {
+		cmd := exec.Command("docker", "kill", ctrID)
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("error killing %s: %s\n", ctrID, err)
+		}
+	}
+
+	// wait for DynamoDB to respond
+	for {
+		select {
+		case <-ctx.Done():
+			cleanupFunc()
+			return nil, ctx.Err()
+		default:
+		}
+
+		_, err := ddbClient.ListTablesWithContext(ctx, &dynamodb.ListTablesInput{})
+		if err == nil {
+			break
+		}
+	}
+
+	return cleanupFunc, err
 }
 
 func forceSDKError(err error) func(*request.Request) {
@@ -83,79 +124,57 @@ type index struct {
 	sortKey      string
 }
 
-func setupTables(ddbClient *dynamodb.DynamoDB, indices ...index) {
-	attrs := map[string]bool{attrNameKey: true}
+type table struct {
+	name         string
+	partitionKey string
+	sortKey      string
+}
 
-	// for each index, add the GSI definition
-	// each index also needs its keys added to the attribute definitions of the main table
-	var gsis []*dynamodb.GlobalSecondaryIndex
-	for _, index := range indices {
-		idx := index
+func setupTables(ddbClient *dynamodb.DynamoDB, tables ...table) {
+	for _, table := range tables {
+		tbl := table
 
-		gsi := &dynamodb.GlobalSecondaryIndex{
+		attrDefs := []*dynamodb.AttributeDefinition{
+			{AttributeName: &tbl.partitionKey, AttributeType: aws.String(dynamodb.ScalarAttributeTypeS)},
+		}
+		keySchema := []*dynamodb.KeySchemaElement{
+			{AttributeName: &tbl.partitionKey, KeyType: aws.String(dynamodb.KeyTypeHash)},
+		}
+		if tbl.sortKey != "" {
+			attrDefs = append(attrDefs, &dynamodb.AttributeDefinition{AttributeName: &tbl.sortKey, AttributeType: aws.String(dynamodb.ScalarAttributeTypeS)})
+			keySchema = append(keySchema, &dynamodb.KeySchemaElement{AttributeName: &tbl.sortKey, KeyType: aws.String(dynamodb.KeyTypeRange)})
+		}
 
-			IndexName: &idx.name,
-			KeySchema: []*dynamodb.KeySchemaElement{{
-				AttributeName: &idx.partitionKey,
-				KeyType:       aws.String(dynamodb.KeyTypeHash),
-			}},
-			Projection: &dynamodb.Projection{ProjectionType: aws.String(dynamodb.ProjectionTypeAll)},
+		req := &dynamodb.CreateTableInput{
+			AttributeDefinitions: attrDefs,
+			KeySchema:            keySchema,
+			TableName:            &tbl.name,
+			BillingMode:          aws.String(dynamodb.BillingModeProvisioned),
 			ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
 				ReadCapacityUnits:  aws.Int64(1000),
 				WriteCapacityUnits: aws.Int64(1000),
 			},
 		}
 
-		attrs[idx.partitionKey] = true
-		if idx.sortKey != "" {
-			attrs[idx.sortKey] = true
-			gsi.KeySchema = append(gsi.KeySchema, &dynamodb.KeySchemaElement{
-				AttributeName: &idx.sortKey,
-				KeyType:       aws.String(dynamodb.KeyTypeRange),
-			})
+		log.Debugw("creating table", "Table", tbl.name, "Req", req)
+		_, err := ddbClient.CreateTable(req)
+		if err != nil {
+			// idempotency
+			if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == dynamodb.ErrCodeResourceInUseException {
+				return
+			}
+			panic(err)
 		}
-
-		gsis = append(gsis, gsi)
-	}
-
-	var attrDefs []*dynamodb.AttributeDefinition
-	for a := range attrs {
-		attrName := a
-		attrDefs = append(attrDefs, &dynamodb.AttributeDefinition{
-			AttributeName: &attrName,
-			AttributeType: aws.String(dynamodb.ScalarAttributeTypeS),
-		})
-	}
-
-	_, err := ddbClient.CreateTable(&dynamodb.CreateTableInput{
-		AttributeDefinitions: attrDefs,
-		KeySchema: []*dynamodb.KeySchemaElement{
-			{
-				AttributeName: aws.String("Key"),
-				KeyType:       aws.String(dynamodb.KeyTypeHash),
-			},
-		},
-		TableName:   &tableName,
-		BillingMode: aws.String(dynamodb.BillingModeProvisioned),
-		ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
-			ReadCapacityUnits:  aws.Int64(1000),
-			WriteCapacityUnits: aws.Int64(1000),
-		},
-		GlobalSecondaryIndexes: gsis,
-	})
-	if err != nil {
-		// idempotency
-		if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == dynamodb.ErrCodeResourceInUseException {
-			return
-		}
-		panic(err)
 	}
 }
 
-func cleanupTables(ddbClient *dynamodb.DynamoDB) {
-	_, err := ddbClient.DeleteTable(&dynamodb.DeleteTableInput{TableName: &tableName})
-	if err != nil {
-		panic(err)
+func cleanupTables(ddbClient *dynamodb.DynamoDB, tables ...table) {
+	for _, t := range tables {
+		log.Debugw("deleting table", "Table", t.name)
+		_, err := ddbClient.DeleteTable(&dynamodb.DeleteTableInput{TableName: &t.name})
+		if err != nil {
+			panic(err)
+		}
 	}
 }
 
@@ -165,10 +184,15 @@ type testDeps struct {
 }
 
 func TestDDBDatastore_PutAndGet(t *testing.T) {
-	inst, _ := startLocalstack()
-	inst, stopLocalstack := startLocalstack()
-	t.Cleanup(stopLocalstack)
-	ddbEndpoint := inst.Endpoint(localstack.DynamoDB)
+	// inst, _ := startLocalstack()
+	// inst, stopLocalstack := startLocalstack()
+	// t.Cleanup(stopLocalstack)
+	// ddbEndpoint := inst.Endpoint(localstack.DynamoDB)
+
+	ddbClient := newDDBClient(clientOpts{endpoint: "http://localhost:8000"})
+	stopDDBLocal, err := startDDBLocal(context.Background(), ddbClient)
+	t.Cleanup(stopDDBLocal)
+	require.NoError(t, err)
 
 	ddbSizedValue := []byte("bar")
 
@@ -203,9 +227,9 @@ func TestDDBDatastore_PutAndGet(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			ctx, stop := context.WithTimeout(context.Background(), 10*time.Second)
 			defer stop()
-			ddbClient := newDDBClient(clientOpts{endpoint: ddbEndpoint})
-			setupTables(ddbClient)
-			defer cleanupTables(ddbClient)
+			tbl := table{name: tableName, partitionKey: "key"}
+			setupTables(ddbClient, tbl)
+			defer cleanupTables(ddbClient, tbl)
 
 			ddbDS := &ddbDatastore{ddbClient: ddbClient, table: tableName}
 			deps := &testDeps{ddbClient: ddbClient, ddbDS: ddbDS}
@@ -246,25 +270,31 @@ type result struct {
 }
 
 func TestDDBDatastore_Query(t *testing.T) {
-	inst, stopLocalstack := startLocalstack()
-	t.Cleanup(stopLocalstack)
-	ddbEndpoint := inst.Endpoint(localstack.DynamoDB)
+	// inst, stopLocalstack := startLocalstack()
+	// t.Cleanup(stopLocalstack)
+	// ddbEndpoint := inst.Endpoint(localstack.DynamoDB)
+	// ddbClient := newDDBClient(clientOpts{endpoint: ddbEndpoint})
+
+	ddbClient := newDDBClient(clientOpts{endpoint: "http://localhost:8000"})
+	stopDDBLocal, err := startDDBLocal(context.Background(), ddbClient)
+	t.Cleanup(stopDDBLocal)
+	require.NoError(t, err)
 
 	orderByKey := []query.Order{&query.OrderByKey{}}
 
-	makeEntries := func(n int) map[string]string {
+	makeEntries := func(keyPrefix string, n int) map[string]string {
 		m := map[string]string{}
 		for i := 0; i < n; i++ {
-			m[fmt.Sprintf("entry%06d", i)] = "val"
+			m[fmt.Sprintf("%s%06d", keyPrefix, i)] = "val"
 		}
 		return m
 	}
 
-	makeExpResult := func(n int) []result {
+	makeExpResult := func(keyPrefix string, n int) []result {
 		var results []result
 		for i := 0; i < n; i++ {
 			results = append(results, result{entry: query.Entry{
-				Key:   fmt.Sprintf("/entry%06d", i),
+				Key:   fmt.Sprintf("%s%06d", keyPrefix, i),
 				Value: []byte("val"),
 			}})
 		}
@@ -272,57 +302,67 @@ func TestDDBDatastore_Query(t *testing.T) {
 	}
 
 	cases := []struct {
-		name          string
-		indices       []index
-		keyTransforms []KeyTransform
-		dsEntries     map[string]string
-		beforeQuery   func(t *testing.T, deps *testDeps)
-		queries       []query.Query
-
-		disableTableScans bool
+		name             string
+		overrideLogLevel *golog.LogLevel
+		tables           []table
+		keyTransforms    []KeyTransform
+		dsEntries        map[string]string
+		beforeQuery      func(t *testing.T, deps *testDeps)
+		queries          []query.Query
 
 		expResults     [][]result
 		expQueryErrors []string
+		expPutError    string
 	}{
 		{
-			name:      "single entry with no key transforms",
-			dsEntries: map[string]string{"foo": "bar"},
-			queries:   []query.Query{{}},
-			expResults: [][]result{{
-				{entry: query.Entry{Key: "/foo", Value: []byte("bar")}},
+			name:             "100 scan entries",
+			overrideLogLevel: &golog.LevelInfo,
+			keyTransforms: []KeyTransform{{
+				Table:            "table1",
+				Prefix:           "/",
+				PartitionKeyName: "table1PartitionKey",
 			}},
+			tables: []table{{
+				name:         "table1",
+				partitionKey: "table1PartitionKey",
+			}},
+			dsEntries:  makeEntries("/entry", 100),
+			queries:    []query.Query{{Orders: orderByKey}},
+			expResults: [][]result{makeExpResult("/entry", 100)},
 		},
 		{
-			name:       "100 entries",
-			dsEntries:  makeEntries(100),
+			name:             "100 scan entries",
+			overrideLogLevel: &golog.LevelInfo,
+			keyTransforms: []KeyTransform{{
+				Table:            "table1",
+				Prefix:           "/",
+				PartitionKeyName: "table1PartitionKey",
+			}},
+			tables: []table{{
+				name:         "table1",
+				partitionKey: "table1PartitionKey",
+			}},
+			dsEntries:  makeEntries("/entry", 100),
 			queries:    []query.Query{{Orders: orderByKey}},
-			expResults: [][]result{makeExpResult(100)},
+			expResults: [][]result{makeExpResult("/entry", 100)},
 		},
 		{
 			name: "prefix query",
+			keyTransforms: []KeyTransform{{
+				Table:            "table1",
+				Prefix:           "/foo",
+				PartitionKeyName: "table1PartitionKey",
+				SortKeyName:      "table1SortKey",
+			}},
+			tables: []table{{
+				name:         "table1",
+				partitionKey: "table1PartitionKey",
+				sortKey:      "table1SortKey",
+			}},
 			dsEntries: map[string]string{
 				"/foo/bar/baz":     "qux",
 				"/foo/bar/baz/qux": "quux",
-
-				// these should not be in the results
-				"/foo/bar":    "baz",
-				"/foo/barbaz": "bang",
-				"/foobar":     "baz",
-				"/quux":       "quuz",
-				"/":           "corge",
 			},
-			indices: []index{{
-				name:         "queryindex1",
-				partitionKey: "index1PartitionKey",
-				sortKey:      "index1SortKey",
-			}},
-			disableTableScans: true,
-			keyTransforms: []KeyTransform{{
-				QueryIndex:       "queryindex1",
-				Prefix:           "/foo",
-				PartitionKeyName: "index1PartitionKey",
-				SortKeyName:      "index1SortKey",
-			}},
 			queries: []query.Query{{Prefix: "/foo/bar", Orders: orderByKey}},
 			expResults: [][]result{{
 				{entry: query.Entry{Key: "/foo/bar/baz", Value: []byte("qux")}},
@@ -330,45 +370,36 @@ func TestDDBDatastore_Query(t *testing.T) {
 			}},
 		},
 		{
-			name: "prefix query with multiple indices",
+			name: "prefix query with multiple tables",
 			keyTransforms: []KeyTransform{
 				{
-					QueryIndex:       "index1",
+					Table:            "table1",
 					Prefix:           "/foo1",
-					PartitionKeyName: "index1PartitionKey",
-					SortKeyName:      "index1SortKey",
+					PartitionKeyName: "table1PartitionKey",
+					SortKeyName:      "table1SortKey",
 				},
 				{
-					QueryIndex:       "index2",
+					Table:            "table2",
 					Prefix:           "/foo2",
-					PartitionKeyName: "index2PartitionKey",
-					SortKeyName:      "index2SortKey",
+					PartitionKeyName: "table2PartitionKey",
+					SortKeyName:      "table2SortKey",
 				},
 			},
-			indices: []index{
+			tables: []table{
 				{
-					name:         "index1",
-					partitionKey: "index1PartitionKey",
-					sortKey:      "index1SortKey",
+					name:         "table1",
+					partitionKey: "table1PartitionKey",
+					sortKey:      "table1SortKey",
 				},
 				{
-					name:         "index2",
-					partitionKey: "index2PartitionKey",
-					sortKey:      "index2SortKey",
+					name:         "table2",
+					partitionKey: "table2PartitionKey",
+					sortKey:      "table2SortKey",
 				},
 			},
-			disableTableScans: true,
 			dsEntries: map[string]string{
 				"/foo1/bar/baz": "quz1",
 				"/foo2/bar/baz": "quz2",
-
-				// these should not be in the results
-				"/foo1bar":  "baz",
-				"/foo1/bar": "baz",
-				"/foo2bar":  "baz",
-				"/foo2/bar": "baz",
-				"/quux":     "quuz",
-				"/":         "corge",
 			},
 			queries: []query.Query{
 				{Prefix: "/foo1/bar", Orders: orderByKey},
@@ -383,17 +414,16 @@ func TestDDBDatastore_Query(t *testing.T) {
 			// TODO: can this tell that sort happened at ddb layer?
 			name: "prefix query with dynamodb-optimized descending order",
 			keyTransforms: []KeyTransform{{
-				QueryIndex:       "index1",
+				Table:            "table1",
 				Prefix:           "/foo",
-				PartitionKeyName: "index1PartitionKey",
-				SortKeyName:      "index1SortKey",
+				PartitionKeyName: "table1PartitionKey",
+				SortKeyName:      "table1SortKey",
 			}},
-			indices: []index{{
-				name:         "index1",
-				partitionKey: "index1PartitionKey",
-				sortKey:      "index1SortKey",
+			tables: []table{{
+				name:         "table1",
+				partitionKey: "table1PartitionKey",
+				sortKey:      "table1SortKey",
 			}},
-			disableTableScans: true,
 			dsEntries: map[string]string{
 				"/foo/z/a": "bar",
 				"/foo/z/c": "bar",
@@ -415,31 +445,30 @@ func TestDDBDatastore_Query(t *testing.T) {
 			name: "prefix query with naive filters and orders, and a non-matching first transform",
 			keyTransforms: []KeyTransform{
 				{
-					QueryIndex:       "index1",
+					Table:            "table1",
 					Prefix:           "/qux",
-					PartitionKeyName: "index1PartitionKey",
-					SortKeyName:      "index1SortKey",
+					PartitionKeyName: "table1PartitionKey",
+					SortKeyName:      "table1SortKey",
 				},
 				{
-					QueryIndex:       "index2",
+					Table:            "table2",
 					Prefix:           "/foo",
-					PartitionKeyName: "index2PartitionKey",
-					SortKeyName:      "index2SortKey",
+					PartitionKeyName: "table2PartitionKey",
+					SortKeyName:      "table2SortKey",
 				},
 			},
-			indices: []index{
+			tables: []table{
 				{
-					name:         "index1",
-					partitionKey: "index1PartitionKey",
-					sortKey:      "index1SortKey",
+					name:         "table1",
+					partitionKey: "table1PartitionKey",
+					sortKey:      "table1SortKey",
 				},
 				{
-					name:         "index2",
-					partitionKey: "index2PartitionKey",
-					sortKey:      "index2SortKey",
+					name:         "table2",
+					partitionKey: "table2PartitionKey",
+					sortKey:      "table2SortKey",
 				},
 			},
-			disableTableScans: true,
 			dsEntries: map[string]string{
 				"/foo/k/a": "bar1",
 				"/foo/k/c": "bar3",
@@ -471,39 +500,54 @@ func TestDDBDatastore_Query(t *testing.T) {
 			name: "all matching transforms are used for putting items, and the first matching transform is used for queries",
 			keyTransforms: []KeyTransform{
 				{
-					QueryIndex:       "index2",
+					Table:            "table1",
 					Prefix:           "/foo/bar",
-					PartitionKeyName: "index2PartitionKey",
-					SortKeyName:      "index2SortKey",
+					PartitionKeyName: "table1PartitionKey",
+					SortKeyName:      "table1SortKey",
 				},
 				{
-					QueryIndex:       "index1",
+					Table:            "table2",
+					Prefix:           "/foo/bar",
+					PartitionKeyName: "table2PartitionKey",
+				},
+				{
+					Table:            "table3",
 					Prefix:           "/foo",
-					PartitionKeyName: "index1PartitionKey",
-					SortKeyName:      "index1SortKey",
-				},
-			},
-			indices: []index{
-				{
-					name:         "index1",
-					partitionKey: "index1PartitionKey",
-					sortKey:      "index1SortKey",
+					PartitionKeyName: "table3PartitionKey",
+					SortKeyName:      "table3SortKey",
 				},
 				{
-					name:         "index2",
-					partitionKey: "index2PartitionKey",
-					sortKey:      "index2SortKey",
+					Table:            "table4",
+					Prefix:           "/foo",
+					PartitionKeyName: "table4PartitionKey",
 				},
 			},
-			disableTableScans: true,
+			tables: []table{
+				{
+					name:         "table1",
+					partitionKey: "table1PartitionKey",
+					sortKey:      "table1SortKey",
+				},
+				{
+					name:         "table2",
+					partitionKey: "table2PartitionKey",
+				},
+				{
+					name:         "table3",
+					partitionKey: "table3PartitionKey",
+					sortKey:      "table3SortKey",
+				},
+				{
+					name:         "table4",
+					partitionKey: "table4PartitionKey",
+				},
+			},
 			dsEntries: map[string]string{
-				"/foo":              "bar",
-				"/foo/bar":          "baz",
 				"/foo/bar/baz":      "bang",
 				"/foo/baz":          "bang",
 				"/foo/bar/baz/bang": "boom",
 
-				"/quux": "quuz",
+				// "/quux": "quuz",
 			},
 			queries: []query.Query{
 				{Prefix: "/foo/bar", Orders: orderByKey},
@@ -511,7 +555,6 @@ func TestDDBDatastore_Query(t *testing.T) {
 			},
 			expResults: [][]result{
 				{
-					{entry: query.Entry{Key: "/foo/bar/baz", Value: []byte("bang")}},
 					{entry: query.Entry{Key: "/foo/bar/baz/bang", Value: []byte("boom")}},
 				},
 				{
@@ -520,62 +563,69 @@ func TestDDBDatastore_Query(t *testing.T) {
 			},
 		},
 		{
-			name: "all matching transforms are used for putting items, and the first matching transform is used for queries",
+			name: "all matching transforms are used for putting items, and the first matching transform is used for queries (different key transform order)",
+			// this is the same as the previous test but the key transform order is different,
+			// leading to different query results
 			keyTransforms: []KeyTransform{
 				{
-					QueryIndex:       "queryindex1",
-					ScanIndex:        "scanindex1",
-					ScanParallelism:  1,
+					Table:            "table3",
 					Prefix:           "/foo",
-					PartitionKeyName: "index1PartitionKey",
-					SortKeyName:      "index1SortKey",
+					PartitionKeyName: "table3PartitionKey",
+					SortKeyName:      "table3SortKey",
 				},
 				{
-					QueryIndex:       "index2",
+					Table:            "table4",
+					Prefix:           "/foo",
+					PartitionKeyName: "table4PartitionKey",
+				},
+				{
+					Table:            "table1",
 					Prefix:           "/foo/bar",
-					PartitionKeyName: "index2PartitionKey",
-					SortKeyName:      "index2SortKey",
-					disableQueries:   true,
+					PartitionKeyName: "table1PartitionKey",
+					SortKeyName:      "table1SortKey",
+				},
+				{
+					Table:            "table2",
+					Prefix:           "/foo/bar",
+					PartitionKeyName: "table2PartitionKey",
 				},
 			},
-			indices: []index{
+			tables: []table{
 				{
-					name:         "queryindex1",
-					partitionKey: "index1PartitionKey",
-					sortKey:      "index1SortKey",
+					name:         "table1",
+					partitionKey: "table1PartitionKey",
+					sortKey:      "table1SortKey",
 				},
 				{
-					name:         "scanindex1",
-					partitionKey: "index1PartitionKey",
-					sortKey:      "index1SortKey",
+					name:         "table2",
+					partitionKey: "table2PartitionKey",
 				},
 				{
-					name:         "index2",
-					partitionKey: "index2PartitionKey",
-					sortKey:      "index2SortKey",
+					name:         "table3",
+					partitionKey: "table3PartitionKey",
+					sortKey:      "table3SortKey",
+				},
+				{
+					name:         "table4",
+					partitionKey: "table4PartitionKey",
 				},
 			},
-			disableTableScans: true,
 			dsEntries: map[string]string{
-				"/foo":              "bar",
-				"/foo/bar":          "baz",
 				"/foo/bar/baz":      "bang",
 				"/foo/baz":          "bang",
 				"/foo/bar/baz/bang": "boom",
-
-				"/quux": "quuz",
 			},
 			queries: []query.Query{
 				{Prefix: "/foo/bar", Orders: orderByKey},
 				{Prefix: "/foo/bar/baz", Orders: orderByKey},
 			},
 			expResults: [][]result{
-				// first query should use queryindex1
+				// first query should use query on table3
 				{
 					{entry: query.Entry{Key: "/foo/bar/baz", Value: []byte("bang")}},
 					{entry: query.Entry{Key: "/foo/bar/baz/bang", Value: []byte("boom")}},
 				},
-				// second query should use scanindex1 and not index2
+				// second query should use scan on table4
 				{
 					{entry: query.Entry{Key: "/foo/bar/baz", Value: []byte("bang")}},
 					{entry: query.Entry{Key: "/foo/bar/baz/bang", Value: []byte("boom")}},
@@ -586,19 +636,17 @@ func TestDDBDatastore_Query(t *testing.T) {
 			name: "root prefix /",
 			keyTransforms: []KeyTransform{
 				{
-					ScanIndex:        "index1",
-					ScanParallelism:  1,
+					Table:            "table1",
 					Prefix:           "/",
-					PartitionKeyName: "index1PartitionKey",
+					PartitionKeyName: "table1PartitionKey",
 				},
 			},
-			indices: []index{
+			tables: []table{
 				{
-					name:         "index1",
-					partitionKey: "index1PartitionKey",
+					name:         "table1",
+					partitionKey: "table1PartitionKey",
 				},
 			},
-			disableTableScans: true,
 			dsEntries: map[string]string{
 				"/foo":              "bar",
 				"/foo/bar":          "baz",
@@ -621,179 +669,59 @@ func TestDDBDatastore_Query(t *testing.T) {
 			name: "scanning prefix",
 			keyTransforms: []KeyTransform{
 				{
-					ScanIndex:        "index1",
-					ScanParallelism:  1,
+					Table:            "table1",
 					Prefix:           "/foo",
-					PartitionKeyName: "index1PartitionKey",
+					PartitionKeyName: "table1PartitionKey",
+					disableQueries:   true,
 				},
 			},
-			indices: []index{
+			tables: []table{
 				{
-					name:         "index1",
-					partitionKey: "index1PartitionKey",
+					name:         "table1",
+					partitionKey: "table1PartitionKey",
 				},
 			},
-			disableTableScans: true,
 			dsEntries: map[string]string{
-				"/foo":         "bar",
-				"/foo/bar":     "baz",
-				"/foo/bar/baz": "bang",
-
-				"/foobar": "baz",
-				"/quux":   "quuz",
+				"/foo/bar":          "baz",
+				"/foo/bar/baz":      "bang",
+				"/foo/bar/baz/bang": "boom",
 			},
 			queries: []query.Query{{Prefix: "/foo", Orders: orderByKey}},
 			expResults: [][]result{{
 				{entry: query.Entry{Key: "/foo/bar", Value: []byte("baz")}},
 				{entry: query.Entry{Key: "/foo/bar/baz", Value: []byte("bang")}},
-			}},
-		},
-		{
-			name: "uses the scan index when there's both a scan and query index and the entry is only one level deep",
-			keyTransforms: []KeyTransform{
-				{
-					QueryIndex:       "queryindex1",
-					ScanIndex:        "scanindex1",
-					ScanParallelism:  1,
-					Prefix:           "/foo",
-					PartitionKeyName: "index1PartitionKey",
-					SortKeyName:      "index1SortKey",
-					disableQueries:   true,
-				},
-			},
-			indices: []index{
-				{
-					name:         "index1",
-					partitionKey: "index1PartitionKey",
-					sortKey:      "index1SortKey",
-				},
-				{
-					name:         "scanindex1",
-					partitionKey: "index1PartitionKey",
-				},
-			},
-			disableTableScans: true,
-			dsEntries:         map[string]string{"/foo/bar": "baz"},
-			queries:           []query.Query{{Prefix: "/foo", Orders: orderByKey}},
-			expResults: [][]result{{
-				{entry: query.Entry{Key: "/foo/bar", Value: []byte("baz")}},
-			}},
-		},
-		{
-			name: "uses the scan index when there's both a scan and query index and the entry is >2 levels deep",
-			keyTransforms: []KeyTransform{
-				{
-					QueryIndex:       "queryindex1",
-					ScanIndex:        "scanindex1",
-					ScanParallelism:  1,
-					Prefix:           "/foo",
-					PartitionKeyName: "index1PartitionKey",
-					SortKeyName:      "index1SortKey",
-					disableQueries:   true,
-				},
-			},
-			indices: []index{
-				{
-					name:         "index1",
-					partitionKey: "index1PartitionKey",
-					sortKey:      "index1SortKey",
-				},
-				{
-					name:         "scanindex1",
-					partitionKey: "index1PartitionKey",
-				},
-			},
-			disableTableScans: true,
-			dsEntries:         map[string]string{"/foo/bar/baz/bang": "boom"},
-			queries:           []query.Query{{Prefix: "/foo", Orders: orderByKey}},
-			expResults: [][]result{{
 				{entry: query.Entry{Key: "/foo/bar/baz/bang", Value: []byte("boom")}},
 			}},
 		},
 		{
-			name: "uses the query index when there's both a scan and query index and the entry is one level deep",
+			name: "scans using the second scan table when the first one doesn't match",
 			keyTransforms: []KeyTransform{
 				{
-					QueryIndex:       "queryindex1",
-					ScanIndex:        "scanindex1",
-					ScanParallelism:  1,
-					Prefix:           "/foo",
-					PartitionKeyName: "index1PartitionKey",
-					SortKeyName:      "index1SortKey",
-					disableScans:     true,
-				},
-			},
-			indices: []index{
-				{
-					name:         "queryindex1",
-					partitionKey: "index1PartitionKey",
-					sortKey:      "index1SortKey",
-				},
-				{
-					name:         "scanindex1",
-					partitionKey: "index1PartitionKey",
-				},
-			},
-			disableTableScans: true,
-			dsEntries:         map[string]string{"/foo/bar/baz": "bang"},
-			queries:           []query.Query{{Prefix: "/foo/bar", Orders: orderByKey}},
-			expResults: [][]result{{
-				{entry: query.Entry{Key: "/foo/bar/baz", Value: []byte("bang")}},
-			}},
-		},
-		{
-			name: "performs an index scan when there's no query index and prefix matches two levels deep",
-			keyTransforms: []KeyTransform{
-				{
-					ScanIndex:        "scanindex1",
-					ScanParallelism:  1,
-					Prefix:           "/foo",
-					PartitionKeyName: "index1PartitionKey",
-				},
-			},
-			indices: []index{
-				{
-					name:         "scanindex1",
-					partitionKey: "index1PartitionKey",
-				},
-			},
-			disableTableScans: true,
-			dsEntries:         map[string]string{"/foo/bar/baz": "bang"},
-			queries:           []query.Query{{Prefix: "/foo/bar", Orders: orderByKey}},
-			expResults: [][]result{{
-				{entry: query.Entry{Key: "/foo/bar/baz", Value: []byte("bang")}},
-			}},
-		},
-		{
-			name: "scans using the second scan index when the first one doesn't match",
-			keyTransforms: []KeyTransform{
-				{
-					ScanIndex:        "scanindex1",
+					Table:            "scantable1",
 					ScanParallelism:  1,
 					Prefix:           "/foo/bar",
-					PartitionKeyName: "index1PartitionKey",
+					PartitionKeyName: "table1PartitionKey",
 					disableScans:     true,
 				},
 				{
-					ScanIndex:        "scanindex2",
+					Table:            "scantable2",
 					ScanParallelism:  1,
 					Prefix:           "/foo/baz",
-					PartitionKeyName: "index2PartitionKey",
+					PartitionKeyName: "table2PartitionKey",
 				},
 			},
-			indices: []index{
+			tables: []table{
 				{
-					name:         "scanindex1",
-					partitionKey: "index1PartitionKey",
+					name:         "scantable1",
+					partitionKey: "table1PartitionKey",
 				},
 				{
-					name:         "scanindex2",
-					partitionKey: "index2PartitionKey",
+					name:         "scantable2",
+					partitionKey: "table2PartitionKey",
 				},
 			},
-			disableTableScans: true,
-			dsEntries:         map[string]string{"/foo/baz/bang": "boom"},
-			queries:           []query.Query{{Prefix: "/foo/baz", Orders: orderByKey}},
+			dsEntries: map[string]string{"/foo/baz/bang": "boom"},
+			queries:   []query.Query{{Prefix: "/foo/baz", Orders: orderByKey}},
 			expResults: [][]result{{
 				{entry: query.Entry{Key: "/foo/baz/bang", Value: []byte("boom")}},
 			}},
@@ -801,86 +729,110 @@ func TestDDBDatastore_Query(t *testing.T) {
 		{
 			// this is internal functionality, but we want to make sure it works
 			// because other tests rely on it
-			name: "returns an error when scans are disabled on an index that matches a query",
+			name: "returns an error when scans are disabled on a scan table that matches a query",
 			keyTransforms: []KeyTransform{
 				{
-					ScanIndex:        "scanindex1",
-					ScanParallelism:  1,
+					Table:            "table1",
 					Prefix:           "/foo",
-					PartitionKeyName: "index1PartitionKey",
+					PartitionKeyName: "table1PartitionKey",
 					disableScans:     true,
 				},
 			},
-			indices: []index{
+			tables: []table{
 				{
-					name:         "scanindex1",
-					partitionKey: "index1PartitionKey",
+					name:         "table1",
+					partitionKey: "table1PartitionKey",
 				},
 			},
-			disableTableScans: true,
-			dsEntries:         map[string]string{"/foo/bar/baz": "bang"},
-			queries:           []query.Query{{Prefix: "/foo/bar", Orders: orderByKey}},
-			expQueryErrors:    []string{"scans on 'scanindex1' are disabled"},
+			dsEntries:      map[string]string{"/foo/bar/baz": "bang"},
+			queries:        []query.Query{{Prefix: "/foo", Orders: orderByKey}},
+			expQueryErrors: []string{"scans on 'table1' are disabled"},
 		},
 		{
 			// this is internal functionality, but we want to make sure it works
 			// because other tests rely on it
-			name: "returns an error when queries are disabled on an index that matches a query",
+			name: "returns an error when queries are disabled on an table that matches a query",
 			keyTransforms: []KeyTransform{
 				{
-					QueryIndex:       "queryindex1",
+					Table:            "table1",
 					Prefix:           "/foo",
-					PartitionKeyName: "index1PartitionKey",
+					PartitionKeyName: "table1PartitionKey",
+					SortKeyName:      "table1SortKey",
 					disableQueries:   true,
 				},
 			},
-			indices: []index{
+			tables: []table{
 				{
-					name:         "queryindex1",
-					partitionKey: "index1PartitionKey",
+					name:         "table1",
+					partitionKey: "table1PartitionKey",
+					sortKey:      "table1SortKey",
 				},
 			},
-			disableTableScans: true,
-			dsEntries:         map[string]string{"/foo/bar/baz": "bang"},
-			queries:           []query.Query{{Prefix: "/foo/bar", Orders: orderByKey}},
-			expQueryErrors:    []string{"queries on 'queryindex1' are disabled"},
+			dsEntries:      map[string]string{"/foo/bar/baz": "bang"},
+			queries:        []query.Query{{Prefix: "/foo/bar", Orders: orderByKey}},
+			expQueryErrors: []string{"queries on 'table1' are disabled"},
 		},
 		{
-			// this is internal functionality, but we want to make sure it works
-			// because other tests rely on it
-			name:              "returns an error when table scans are disabled and a query results in a table scan",
-			disableTableScans: true,
-			dsEntries:         map[string]string{"/foo/bar/baz": "bang"},
-			queries:           []query.Query{{Prefix: "/foo/bar", Orders: orderByKey}},
-			expQueryErrors:    []string{"table scans are disabled"},
+			name: "returns an error if transform is missing the table's sort key",
+			// Note that the inverse isn't true, if the table is missing the sort key then we have no idea
+			// because DynamoDB will still happily accept the "sort" key as just another attribute, and
+			// then the item will only appear in scans.
+			//
+			// There's not much we can do about this, perhaps describe the tables when the datastore
+			// starts up and verify that they their schema matches the key transforms?
+			keyTransforms: []KeyTransform{
+				{
+					Table:            "table1",
+					Prefix:           "/foo",
+					PartitionKeyName: "table1PartitionKey",
+				},
+			},
+			tables: []table{
+				{
+					name:         "table1",
+					partitionKey: "table1PartitionKey",
+					sortKey:      "table1SortKey",
+				},
+			},
+			dsEntries:   map[string]string{"/foo/bar/baz": "bang"},
+			expPutError: "One of the required keys was not given a value",
 		},
-		
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			ctx, stop := context.WithTimeout(context.Background(), 60*time.Second)
 			defer stop()
-			ddbClient := newDDBClient(clientOpts{endpoint: ddbEndpoint})
-			setupTables(ddbClient, c.indices...)
-			defer cleanupTables(ddbClient)
+
+			if c.overrideLogLevel != nil {
+				golog.SetAllLoggers(*c.overrideLogLevel)
+				defer golog.SetAllLoggers(logLevel)
+			}
+
+			setupTables(ddbClient, c.tables...)
+			defer cleanupTables(ddbClient, c.tables...)
 
 			ddbDS := &ddbDatastore{
-				ddbClient:         ddbClient,
-				table:             tableName,
-				ScanParallelism:   10,
-				keyTransforms:     c.keyTransforms,
-				disableTableScans: c.disableTableScans,
+				ddbClient:       ddbClient,
+				table:           tableName,
+				ScanParallelism: 10,
+				keyTransforms:   c.keyTransforms,
 			}
 			deps := &testDeps{ddbClient: ddbClient, ddbDS: ddbDS}
 
 			for k, v := range c.dsEntries {
 				err := deps.ddbDS.Put(ctx, ds.NewKey(k), []byte(v))
+				if c.expPutError != "" {
+					require.Error(t, err)
+					require.Contains(t, err.Error(), c.expPutError)
+					return
+				}
 				require.NoError(t, err)
 			}
 			for i, q := range c.queries {
 				// we run this in a func so we can defer closing the result stream
 				func() {
+					log.Debugw("test querying", "Query", q)
 					res, err := ddbDS.Query(ctx, q)
 					if res != nil {
 						defer res.Close()
