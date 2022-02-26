@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -21,7 +22,7 @@ import (
 )
 
 const (
-	attrNameKey        = "Key"
+	attrNameDSKey      = "DSKey"
 	attrNameSize       = "Size"
 	attrNameExpiration = "Expiration"
 )
@@ -56,7 +57,7 @@ func WithKeyTransform(k KeyTransform) func(o *Options) {
 	}
 }
 
-func New(ddbClient *dynamodb.DynamoDB, table string, optFns ...func(o *Options)) (*ddbDatastore, error) {
+func New(ddbClient *dynamodb.DynamoDB, optFns ...func(o *Options)) (*ddbDatastore, error) {
 	opts := Options{}
 	for _, o := range optFns {
 		o(&opts)
@@ -67,7 +68,6 @@ func New(ddbClient *dynamodb.DynamoDB, table string, optFns ...func(o *Options))
 		ScanParallelism:            opts.ScanParallelism,
 		useStronglyConsistentReads: opts.UseStronglyConsistentReads,
 		keyTransforms:              opts.KeyTransforms,
-		table:                      table,
 	}
 
 	if ddbDS.ScanParallelism == 0 {
@@ -79,7 +79,6 @@ func New(ddbClient *dynamodb.DynamoDB, table string, optFns ...func(o *Options))
 
 type ddbDatastore struct {
 	ddbClient *dynamodb.DynamoDB
-	table     string
 
 	useStronglyConsistentReads bool
 
@@ -101,7 +100,7 @@ var _ ds.Datastore = (*ddbDatastore)(nil)
 // ddbItem is a raw DynamoDB item.
 // Note that some attributes may not be present if a projection expression was used when reading the item.
 type ddbItem struct {
-	Key        string
+	DSKey      string
 	Value      []byte `dynamodbav:",omitempty"`
 	Size       int64
 	Expiration int64
@@ -123,7 +122,7 @@ func unmarshalItem(itemMap map[string]*dynamodb.AttributeValue) (*ddbItem, error
 // makeGetKey makes a DynamoDB key from a datastore key, for GetItem requests.
 func (d *ddbDatastore) makeGetKey(key ds.Key) (Key, error) {
 	for _, transform := range d.keyTransforms {
-		k, ok := transform.PutKey(key)
+		k, ok := transform.GetKey(key)
 		if !ok {
 			continue
 		}
@@ -135,21 +134,31 @@ func (d *ddbDatastore) makeGetKey(key ds.Key) (Key, error) {
 // makePutKey makes a DynamoDB key from a datastore key, for PutItem requests.
 // It populates all the attributes for all the registered indices.
 func (d *ddbDatastore) makePutKeys(key ds.Key) ([]Key, error) {
-	var keys []Key
+	// var keys []Key
 
-	// add any additional index keys
+	// // add any additional index keys
+	// for _, transform := range d.keyTransforms {
+	// 	transformKey, ok := transform.PutKey(key)
+	// 	if !ok {
+	// 		// TODO metric?
+	// 		continue
+	// 	}
+	// 	keys = append(keys, transformKey)
+	// }
+	// if len(keys) == 0 {
+	// 	return nil, ErrNoMatchingKeyTransforms
+	// }
+	// return keys, nil
+
 	for _, transform := range d.keyTransforms {
 		transformKey, ok := transform.PutKey(key)
 		if !ok {
 			// TODO metric?
 			continue
 		}
-		keys = append(keys, transformKey)
+		return []Key{transformKey}, nil
 	}
-	if len(keys) == 0 {
-		return nil, ErrNoMatchingKeyTransforms
-	}
-	return keys, nil
+	return nil, ErrNoMatchingKeyTransforms
 }
 
 // getItem fetches an item from DynamoDB.
@@ -167,7 +176,7 @@ func (d *ddbDatastore) getItem(ctx context.Context, key ds.Key, attributes []str
 	}
 
 	res, err := d.ddbClient.GetItemWithContext(ctx, &dynamodb.GetItemInput{
-		TableName:            &d.table,
+		TableName:            &ddbKey.Table,
 		Key:                  ddbKey.Attrs,
 		ConsistentRead:       &d.useStronglyConsistentReads,
 		ProjectionExpression: projExpr,
@@ -196,7 +205,7 @@ func (d *ddbDatastore) Has(ctx context.Context, key ds.Key) (bool, error) {
 	}
 
 	res, err := d.ddbClient.GetItemWithContext(ctx, &dynamodb.GetItemInput{
-		TableName:            &d.table,
+		TableName:            &k.Table,
 		Key:                  k.Attrs,
 		ProjectionExpression: aws.String(k.PartitionKeyName), // TODO: if we set this to some non-existent key, will it return an empty item?  that would be betters
 	})
@@ -224,10 +233,11 @@ func (d *ddbDatastore) put(ctx context.Context, key ds.Key, value []byte, ttl ti
 		ClientRequestToken: aws.String(uuid.New().String()),
 	}
 
-	for _, key := range keys {
+	for _, putKey := range keys {
 		item := &ddbItem{
 			Size:  int64(len(value)),
 			Value: value,
+			DSKey: key.String(),
 		}
 
 		if ttl > 0 {
@@ -239,13 +249,17 @@ func (d *ddbDatastore) put(ctx context.Context, key ds.Key, value []byte, ttl ti
 			return fmt.Errorf("marshaling item: %w", err)
 		}
 
-		for k, v := range key.Attrs {
+		log.Debugw("item map to put", "ItemMap", itemMap)
+
+		for k, v := range putKey.Attrs {
 			itemMap[k] = v
 		}
 
+		log.Debugw("final item map to put", "ItemMap", itemMap)
+
 		req.TransactItems = append(req.TransactItems, &dynamodb.TransactWriteItem{
 			Put: &dynamodb.Put{
-				TableName: aws.String(key.Table),
+				TableName: aws.String(putKey.Table),
 				Item:      itemMap,
 			},
 		})
@@ -273,7 +287,7 @@ func (d *ddbDatastore) Delete(ctx context.Context, key ds.Key) error {
 	}
 
 	req := &dynamodb.DeleteItemInput{
-		TableName: &d.table,
+		TableName: &k.Table,
 		Key:       k.Attrs,
 	}
 
@@ -367,6 +381,25 @@ func (d *ddbDatastore) Query(ctx context.Context, q query.Query) (query.Results,
 		return nil, ErrNoMatchingKeyTransforms
 	}
 
+	// this is copied from go-datastore since it isn't reusable
+	if q.Prefix != "" {
+		// Clean the prefix as a key and append / so a prefix of /bar
+		// only finds /bar/baz, not /barbaz.
+		prefix := q.Prefix
+		if len(prefix) == 0 {
+			prefix = "/"
+		} else {
+			if prefix[0] != '/' {
+				prefix = "/" + prefix
+			}
+			prefix = path.Clean(prefix)
+		}
+		// If the prefix is empty, ignore it.
+		if prefix != "/" {
+			results = query.NaiveFilter(results, query.FilterKeyPrefix{Prefix: prefix + "/"})
+		}
+	}
+
 	// TODO: some kinds of filters can be done server-side
 	for _, f := range q.Filters {
 		results = query.NaiveFilter(results, f)
@@ -418,7 +451,7 @@ func (d *ddbDatastore) SetTTL(ctx context.Context, key ds.Key, ttl time.Duration
 					":e": {N: &expirationStr},
 				},
 				ConditionExpression:      aws.String("attribute_exists(#k)"),
-				ExpressionAttributeNames: map[string]*string{"#k": aws.String(attrNameKey)},
+				ExpressionAttributeNames: map[string]*string{"#k": aws.String(attrNameDSKey)},
 			},
 		})
 	}
@@ -434,7 +467,7 @@ func (d *ddbDatastore) SetTTL(ctx context.Context, key ds.Key, ttl time.Duration
 				return ds.ErrNotFound
 			}
 		}
-		return fmt.Errorf("setting TTL DynamoDB item to table '%s': %w", d.table, err)
+		return fmt.Errorf("setting DynamoDB TTL: %w", err)
 	}
 	return nil
 }

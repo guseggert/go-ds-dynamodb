@@ -94,7 +94,7 @@ func (p *KeyTransform) QueryKey(queryPrefix string) (Key, bool) {
 	return key, true
 }
 
-func (p *KeyTransform) PutKey(key ds.Key) (Key, bool) {
+func (p *KeyTransform) GetKey(key ds.Key) (Key, bool) {
 	keyNamespaces := p.namespaces(key)
 	prefixNamespaces := p.namespaces(ds.NewKey(p.Prefix))
 
@@ -102,11 +102,10 @@ func (p *KeyTransform) PutKey(key ds.Key) (Key, bool) {
 	if !isPrefix || len(trimmed) == 0 {
 		return Key{}, false
 	}
+
 	log.Debugw("trimmed put key", "TrimmedKey", trimmed)
 
-	attrs := map[string]*dynamodb.AttributeValue{
-		attrNameKey: {S: aws.String(key.String())},
-	}
+	attrs := map[string]*dynamodb.AttributeValue{}
 
 	if p.SortKeyName == "" {
 		partitionKey := strings.Join(trimmed, "/")
@@ -137,6 +136,17 @@ func (p *KeyTransform) PutKey(key ds.Key) (Key, bool) {
 		disableScan:      p.disableScans,
 		disableQuery:     p.disableQueries,
 	}, true
+}
+
+func (p *KeyTransform) PutKey(key ds.Key) (Key, bool) {
+	// the put key is the same as the get key, except we add the additional Key attribute (the full datastore key)
+	// this isn't strictly necessary since we can reconstruct the key, but makes digging through DynamoDB items easier
+	k, ok := p.GetKey(key)
+	if !ok {
+		return k, false
+	}
+	k.Attrs[attrNameDSKey] = &dynamodb.AttributeValue{S: aws.String(key.String())}
+	return k, true
 }
 
 func (p *KeyTransform) trimPrefix(ss []string, prefix []string) ([]string, bool) {

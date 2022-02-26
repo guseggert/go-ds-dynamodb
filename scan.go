@@ -33,6 +33,7 @@ func (s *scanIterator) trySend(result query.Result) bool {
 	case <-s.ctx.Done():
 		return true
 	case s.resultChan <- result:
+		log.Debugw("sent result", "Result", result)
 	}
 	return false
 }
@@ -53,7 +54,7 @@ func (s *scanIterator) worker(ctx context.Context, segment int64, totalSegments 
 		}
 
 		if s.keysOnly {
-			req.ProjectionExpression = aws.String(attrNameKey)
+			req.ProjectionExpression = aws.String(attrNameDSKey)
 		}
 
 		res, err := s.ddbClient.ScanWithContext(s.ctx, req)
@@ -81,7 +82,7 @@ func itemMapToQueryResult(itemMap map[string]*dynamodb.AttributeValue, keysOnly 
 	if err != nil {
 		return query.Result{Error: err}
 	}
-	result := query.Result{Entry: query.Entry{Key: item.Key}}
+	result := query.Result{Entry: query.Entry{Key: item.DSKey}}
 	if !keysOnly {
 		result.Expiration = item.GetExpiration()
 		result.Size = int(item.Size)
