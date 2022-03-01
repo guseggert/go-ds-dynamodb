@@ -29,6 +29,7 @@ type scanIterator struct {
 }
 
 func (s *scanIterator) trySend(result query.Result) bool {
+	log.Debugw("sending scan result", "Result", result)
 	select {
 	case <-s.ctx.Done():
 		return true
@@ -39,6 +40,8 @@ func (s *scanIterator) trySend(result query.Result) bool {
 
 func (s *scanIterator) worker(ctx context.Context, segment int64, totalSegments int64) {
 	defer s.doneWG.Done()
+	defer log.Debug("scan worker done")
+	log.Debug("scan worker starting")
 	var exclusiveStartKey map[string]*dynamodb.AttributeValue
 	for {
 		req := &dynamodb.ScanInput{
@@ -63,6 +66,7 @@ func (s *scanIterator) worker(ctx context.Context, segment int64, totalSegments 
 			}
 		}
 		for _, itemMap := range res.Items {
+			log.Debugw("scan got items", "NumItems", len(res.Items))
 			result := itemMapToQueryResult(itemMap, s.keysOnly)
 			if s.trySend(result) {
 				return
@@ -73,7 +77,6 @@ func (s *scanIterator) worker(ctx context.Context, segment int64, totalSegments 
 		}
 		exclusiveStartKey = res.LastEvaluatedKey
 	}
-
 }
 
 func itemMapToQueryResult(itemMap map[string]*dynamodb.AttributeValue, keysOnly bool) query.Result {
@@ -81,7 +84,7 @@ func itemMapToQueryResult(itemMap map[string]*dynamodb.AttributeValue, keysOnly 
 	if err != nil {
 		return query.Result{Error: err}
 	}
-	result := query.Result{Entry: query.Entry{Key: item.Key}}
+	result := query.Result{Entry: query.Entry{Key: item.DSKey}}
 	if !keysOnly {
 		result.Expiration = item.GetExpiration()
 		result.Size = int(item.Size)
