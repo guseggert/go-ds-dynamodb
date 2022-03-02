@@ -16,7 +16,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/elgohr/go-localstack"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
 	golog "github.com/ipfs/go-log/v2"
@@ -33,26 +32,6 @@ var (
 
 func init() {
 	golog.SetAllLoggers(logLevel)
-}
-
-func startLocalstack() (*localstack.Instance, func()) {
-	inst, err := localstack.NewInstance()
-	if err != nil {
-		panic(err)
-	}
-	err = inst.StartWithContext(
-		context.Background(),
-		localstack.DynamoDB,
-	)
-	if err != nil {
-		panic(err)
-	}
-	return inst, func() {
-		err := inst.Stop()
-		if err != nil {
-			log.Errorw("error shutting down localstack instance", "Error", err.Error())
-		}
-	}
 }
 
 func startDDBLocal(ctx context.Context, ddbClient *dynamodb.DynamoDB) (func(), error) {
@@ -172,17 +151,180 @@ func cleanupTables(ddbClient *dynamodb.DynamoDB, tables ...table) {
 	}
 }
 
-type testDeps struct {
-	ddbClient *dynamodb.DynamoDB
-	ddbDS     *DDBDatastore
+func TestDDBDatastore_Batch(t *testing.T) {
+	ddbClient := newDDBClient(clientOpts{endpoint: "http://localhost:8000"})
+	stopDDBLocal, err := startDDBLocal(context.Background(), ddbClient)
+	t.Cleanup(stopDDBLocal)
+	require.NoError(t, err)
+
+	type batchOp struct {
+		key      string
+		value    string
+		isDelete bool
+	}
+
+	type batch struct {
+		forceCommitErr bool
+		ops            []batchOp
+	}
+
+	type batchErrs struct {
+		batchErr  string
+		commitErr string
+	}
+
+	type entry struct {
+		key   string
+		value string
+		err   string
+	}
+
+	makeBatch := func(start, n int) batch {
+		b := batch{}
+		for i := start; i < n; i++ {
+			b.ops = append(b.ops, batchOp{key: "key-%06d", value: "val-%06d"})
+		}
+		return b
+	}
+
+	makeDeleteBatch := func(start, n int) batch {
+		b := batch{}
+		for i := start; i < n; i++ {
+			b.ops = append(b.ops, batchOp{key: "key-%06d", isDelete: true})
+		}
+		return b
+	}
+
+	makeExpEntries := func(start, n int) []entry {
+		var entries []entry
+		for i := start; i < n; i++ {
+			entries = append(entries, entry{key: "key-%06d", value: "val-%06d"})
+		}
+		return entries
+	}
+
+	concatEntries := func(entries ...[]entry) []entry {
+		var es []entry
+		for _, e := range entries {
+			es = append(es, e...)
+		}
+		return es
+	}
+
+	cases := []struct {
+		name    string
+		batches []batch
+
+		expBatchErrs []batchErrs
+		expEntries   []entry
+	}{
+		{
+			name:       "1 entry",
+			batches:    []batch{{ops: []batchOp{{key: "/foo", value: "bar"}}}},
+			expEntries: []entry{{key: "/foo", value: "bar"}},
+		},
+		{
+			name: "multiple batches",
+			batches: []batch{
+				{ops: []batchOp{{key: "/a", value: "a-val"}}},
+				{ops: []batchOp{{key: "/b", value: "b-val"}}},
+				{ops: []batchOp{{key: "/c", value: "c-val"}}},
+			},
+			expEntries: []entry{
+				{key: "/a", value: "a-val"},
+				{key: "/b", value: "b-val"},
+				{key: "/c", value: "c-val"},
+			},
+		},
+		{
+			name:       "one large batch that exceeds DynamoDB batch limit",
+			batches:    []batch{makeBatch(0, 100)},
+			expEntries: makeExpEntries(0, 100),
+		},
+		{
+			name: "multiple large batches that exceed DynamoDB batch limit",
+			batches: []batch{
+				makeBatch(0, 100),
+				makeBatch(100, 100),
+			},
+			expEntries: makeExpEntries(0, 200),
+		},
+		{
+			name: "batch deletes work",
+			batches: []batch{
+				makeBatch(0, 100),
+				makeDeleteBatch(80, 20),
+				makeBatch(100, 10),
+			},
+			expEntries: concatEntries(makeExpEntries(0, 80), makeExpEntries(100, 109)),
+		},
+		{
+			name: "returns an error on commit error",
+			batches: []batch{
+				{
+					ops:            []batchOp{{key: "/a", value: "a-val"}},
+					forceCommitErr: true,
+				},
+			},
+			expBatchErrs: []batchErrs{{commitErr: "ResourceNotFoundException"}},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			tbl := table{name: tableName, partitionKey: "key"}
+			setupTables(ddbClient, tbl)
+			defer cleanupTables(ddbClient, tbl)
+
+			ddbDS := DDBDatastore{
+				ddbClient:    ddbClient,
+				table:        tableName,
+				partitionKey: "key",
+			}
+
+			for batchIdx, batch := range c.batches {
+				func() {
+					b, err := ddbDS.Batch(ctx)
+					require.NoError(t, err)
+					for _, op := range batch.ops {
+						if op.isDelete {
+							err := b.Delete(ctx, ds.NewKey(op.key))
+							require.NoError(t, err)
+						} else {
+							err := b.Put(ctx, ds.NewKey(op.key), []byte(op.value))
+							require.NoError(t, err)
+						}
+					}
+					if batch.forceCommitErr {
+						originalTable := ddbDS.table
+						ddbDS.table = "non-existent-table"
+						defer func() { ddbDS.table = originalTable }()
+					}
+					err = b.Commit(ctx)
+					if c.expBatchErrs != nil && c.expBatchErrs[batchIdx].commitErr != "" {
+						assert.Error(t, err)
+						assert.Contains(t, err.Error(), c.expBatchErrs[batchIdx].commitErr)
+						return
+					}
+					require.NoError(t, err)
+				}()
+			}
+
+			for _, expEntry := range c.expEntries {
+				val, err := ddbDS.Get(ctx, ds.NewKey(expEntry.key))
+				if expEntry.err != "" {
+					assert.Error(t, err)
+					assert.Contains(t, err.Error(), expEntry.err)
+					continue
+				}
+				require.NoError(t, err)
+				assert.EqualValues(t, expEntry.value, val)
+			}
+		})
+	}
 }
 
 func TestDDBDatastore_PutAndGet(t *testing.T) {
-	// inst, _ := startLocalstack()
-	// inst, stopLocalstack := startLocalstack()
-	// t.Cleanup(stopLocalstack)
-	// ddbEndpoint := inst.Endpoint(localstack.DynamoDB)
-
 	ddbClient := newDDBClient(clientOpts{endpoint: "http://localhost:8000"})
 	stopDDBLocal, err := startDDBLocal(context.Background(), ddbClient)
 	t.Cleanup(stopDDBLocal)
@@ -191,12 +333,10 @@ func TestDDBDatastore_PutAndGet(t *testing.T) {
 	ddbSizedValue := []byte("bar")
 
 	cases := []struct {
-		name      string
-		putKey    string
-		getKey    string
-		value     []byte
-		beforePut func(deps *testDeps)
-		beforeGet func(deps *testDeps)
+		name   string
+		putKey string
+		getKey string
+		value  []byte
 
 		expectPutErrContains string
 		expectGetErrContains string
@@ -219,17 +359,17 @@ func TestDDBDatastore_PutAndGet(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			ctx, stop := context.WithTimeout(context.Background(), 10*time.Second)
-			defer stop()
+			ctx := context.Background()
 			tbl := table{name: tableName, partitionKey: "key"}
 			setupTables(ddbClient, tbl)
 			defer cleanupTables(ddbClient, tbl)
 
-			ddbDS := &DDBDatastore{ddbClient: ddbClient, table: tableName}
-			deps := &testDeps{ddbClient: ddbClient, ddbDS: ddbDS}
-
-			if c.beforePut != nil {
-				c.beforePut(deps)
+			ddbDS := &DDBDatastore{
+				ddbClient:      ddbClient,
+				table:          tableName,
+				partitionKey:   "key",
+				disableQueries: true,
+				disableScans:   true,
 			}
 
 			err := ddbDS.Put(ctx, ds.NewKey(c.putKey), c.value)
@@ -239,10 +379,6 @@ func TestDDBDatastore_PutAndGet(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-
-			if c.beforeGet != nil {
-				c.beforeGet(deps)
-			}
 
 			val, err := ddbDS.Get(ctx, ds.NewKey(c.getKey))
 			if c.expectGetErrContains != "" {
@@ -258,17 +394,12 @@ func TestDDBDatastore_PutAndGet(t *testing.T) {
 	}
 }
 
-type result struct {
+type queryResult struct {
 	entry query.Entry
 	err   string
 }
 
 func TestDDBDatastore_Query(t *testing.T) {
-	// inst, stopLocalstack := startLocalstack()
-	// t.Cleanup(stopLocalstack)
-	// ddbEndpoint := inst.Endpoint(localstack.DynamoDB)
-	// ddbClient := newDDBClient(clientOpts{endpoint: ddbEndpoint})
-
 	ddbClient := newDDBClient(clientOpts{endpoint: "http://localhost:8000"})
 	stopDDBLocal, err := startDDBLocal(context.Background(), ddbClient)
 	t.Cleanup(stopDDBLocal)
@@ -284,10 +415,10 @@ func TestDDBDatastore_Query(t *testing.T) {
 		return m
 	}
 
-	makeExpResult := func(keyPrefix string, n int) []result {
-		var results []result
+	makeExpResult := func(keyPrefix string, n int) []queryResult {
+		var results []queryResult
 		for i := 0; i < n; i++ {
-			results = append(results, result{entry: query.Entry{
+			results = append(results, queryResult{entry: query.Entry{
 				Key:   fmt.Sprintf("%s%06d", keyPrefix, i),
 				Value: []byte("val"),
 			}})
@@ -301,10 +432,9 @@ func TestDDBDatastore_Query(t *testing.T) {
 		table            table
 		ddbDS            *DDBDatastore
 		dsEntries        map[string]string
-		beforeQuery      func(t *testing.T, deps *testDeps)
 		queries          []query.Query
 
-		expResults     [][]result
+		expResults     [][]queryResult
 		expQueryErrors []string
 		expPutError    string
 	}{
@@ -325,7 +455,7 @@ func TestDDBDatastore_Query(t *testing.T) {
 			},
 			dsEntries:  makeEntries("/a/b", 100),
 			queries:    []query.Query{{Prefix: "/a", Orders: orderByKey}},
-			expResults: [][]result{makeExpResult("/a/b", 100)},
+			expResults: [][]queryResult{makeExpResult("/a/b", 100)},
 		},
 		{
 			name:             "100 scan entries",
@@ -342,7 +472,7 @@ func TestDDBDatastore_Query(t *testing.T) {
 			},
 			dsEntries:  makeEntries("/a", 100),
 			queries:    []query.Query{{Orders: orderByKey}},
-			expResults: [][]result{makeExpResult("/a", 100)},
+			expResults: [][]queryResult{makeExpResult("/a", 100)},
 		},
 		{
 			name: "prefix query",
@@ -362,7 +492,7 @@ func TestDDBDatastore_Query(t *testing.T) {
 				"/foo/bar/baz/qux": "quux",
 			},
 			queries: []query.Query{{Prefix: "/foo/bar", Orders: orderByKey}},
-			expResults: [][]result{{
+			expResults: [][]queryResult{{
 				{entry: query.Entry{Key: "/foo/bar/baz", Value: []byte("qux")}},
 				{entry: query.Entry{Key: "/foo/bar/baz/qux", Value: []byte("quux")}},
 			}},
@@ -392,7 +522,7 @@ func TestDDBDatastore_Query(t *testing.T) {
 				Prefix: "/foo/z",
 				Orders: []query.Order{&query.OrderByKeyDescending{}},
 			}},
-			expResults: [][]result{{
+			expResults: [][]queryResult{{
 				{entry: query.Entry{Key: "/foo/z/c", Value: []byte("bar")}},
 				{entry: query.Entry{Key: "/foo/z/b", Value: []byte("bar")}},
 				{entry: query.Entry{Key: "/foo/z/a", Value: []byte("bar")}},
@@ -433,7 +563,7 @@ func TestDDBDatastore_Query(t *testing.T) {
 					Key: "/foo/k/c",
 				}},
 			}},
-			expResults: [][]result{{
+			expResults: [][]queryResult{{
 				{entry: query.Entry{Key: "/foo/k/g", Value: []byte("bar7")}},
 				{entry: query.Entry{Key: "/foo/k/f", Value: []byte("bar6")}},
 			}},
@@ -459,7 +589,7 @@ func TestDDBDatastore_Query(t *testing.T) {
 				"/quux":             "quuz",
 			},
 			queries: []query.Query{{Prefix: "/", Orders: orderByKey}},
-			expResults: [][]result{{
+			expResults: [][]queryResult{{
 				{entry: query.Entry{Key: "/foo", Value: []byte("bar")}},
 				{entry: query.Entry{Key: "/foo/bar", Value: []byte("baz")}},
 				{entry: query.Entry{Key: "/foo/bar/baz", Value: []byte("bang")}},
@@ -486,7 +616,7 @@ func TestDDBDatastore_Query(t *testing.T) {
 				"/foo/bar/baz/bang": "boom",
 			},
 			queries: []query.Query{{Prefix: "/foo", Orders: orderByKey}},
-			expResults: [][]result{{
+			expResults: [][]queryResult{{
 				{entry: query.Entry{Key: "/foo/bar", Value: []byte("baz")}},
 				{entry: query.Entry{Key: "/foo/bar/baz", Value: []byte("bang")}},
 				{entry: query.Entry{Key: "/foo/bar/baz/bang", Value: []byte("boom")}},
@@ -566,10 +696,8 @@ func TestDDBDatastore_Query(t *testing.T) {
 			setupTables(ddbClient, c.table)
 			defer cleanupTables(ddbClient, c.table)
 
-			deps := &testDeps{ddbClient: ddbClient, ddbDS: c.ddbDS}
-
 			for k, v := range c.dsEntries {
-				err := deps.ddbDS.Put(ctx, ds.NewKey(k), []byte(v))
+				err := c.ddbDS.Put(ctx, ds.NewKey(k), []byte(v))
 				if c.expPutError != "" {
 					require.Error(t, err)
 					require.Contains(t, err.Error(), c.expPutError)

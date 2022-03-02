@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
+	"github.com/ipfs/go-datastore"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
 	golog "github.com/ipfs/go-log/v2"
@@ -426,4 +427,43 @@ func (d *DDBDatastore) GetExpiration(ctx context.Context, key ds.Key) (time.Time
 		return time.Time{}, err
 	}
 	return item.GetExpiration(), nil
+}
+
+// func (d *ddbDatastore) NewTransaction(ctx context.Context, readOnly bool) (ds.Txn, error) {
+// 	return nil, nil
+// }
+
+type txn struct {
+}
+
+func (t *txn) Get(ctx context.Context, key datastore.Key) (value []byte, err error) {
+	panic("not implemented") // TODO: Implement
+}
+
+func (t *txn) Has(ctx context.Context, key datastore.Key) (exists bool, err error) {
+	panic("not implemented") // TODO: Implement
+}
+
+func (t *txn) GetSize(ctx context.Context, key datastore.Key) (size int, err error) {
+	panic("not implemented") // TODO: Implement
+}
+
+func (t *txn) Query(ctx context.Context, q query.Query) (query.Results, error) {
+	panic("not implemented") // TODO: Implement
+}
+
+func (t *txn) Put(ctx context.Context, key datastore.Key, value []byte) error {
+	panic("not implemented") // TODO: Implement
+}
+
+func (t *txn) Delete(ctx context.Context, key datastore.Key) error {
+	panic("not implemented") // TODO: Implement
+}
+
+func (t *txn) Commit(ctx context.Context) error {
+	panic("not implemented") // TODO: Implement
+}
+
+func (t *txn) Discard(ctx context.Context) {
+	panic("not implemented") // TODO: Implement
 }
