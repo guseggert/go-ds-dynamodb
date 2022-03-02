@@ -13,61 +13,101 @@ In this case, all datastore queries will result in full table scans using the Pa
 
 This is a good option if your table is small or your data and access patterns would not significantly benefit from optimized queries.
 
-### Advanced Setup with Optimized Prefix Queries ###
-Certain types of datastore queries can be optimized using DynamoDB features:
+```go
+var ddbClient *dynamodb.DynamoDB = ...
+tableName := "datastore-table"
+ddbDS := ddbds.New(ddbClient, tableName)
+```
 
-* Prefix queries
-  * Can be mapped to Global Secondary Indexes (GSIs) for reducing the number of items needed to query/scan
-  * Very useful for high-cardinality prefixes like DHT Provider records
-* Ordering by key
-  * DynamoDB keep results under a "partition key" sorted by the "sort key". We can use this property to return streaming sorted results, otherwise we'd need to buffer all results in-memory first in order to sort client-side.
+By default the expected partition key is `DSKey` of type `string`. The name can be customized with the `WithPartitionKey()` option.
 
-You can create your table with such indexes and register them with ddbds, and it will "do the right thing", including:
 
-* Writing items with the correct key schema so that they are propagated into the correct GSIs
-* Optimize queries that match the prefixes so that they use the correct GSI
+### Optimized Queries ###
+To use optimized prefix queries, you must specify a sort key. 
 
-This will result in reduced read capacity utilization and lower latency, and as a result, better application scalability.
+Also, elements written into the datastore should have at least 2 parts, such as `/a/b` and not `/a`. 
 
-To do this, define a "key transform" which describes how a datastore key maps to a GSI key:
+`ddbds` splits the key into partition and sort keys.  Examples:
+
+* `/a` -> error (not enough parts)
+* `/a/b` -> [`a`, `b`]
+* `/a/b/c` -> [`a`, `b/c`]
+* etc.
+
+To use optimized queries, simply specify the sort key name using the `WithSortKey()` option:
 
 ```go
+var ddbClient *dynamodb.DynamoDB = ...
+tableName := "datastore-table"
 ddbDS := ddbds.New(
-	ddbClient,
-	"TableName",
-	ddbds.WithKeyTransform(ddbds.KeyTransform{
-		Prefix: "/providers",
-		QueryIndex: "ProvidersQueryIndex",
-		PartitionKeyName: "ContentHash",
-		SortKeyName: "PeerID",
-	}),
+	ddbClient, 
+	tableName,
+	ddbds.WithPartitionKey("PartitionKey"),
+	ddbds.WithSortKey("SortKey"),
 )
 ```
 
-Fore example, when you write an entry into the datastore such as `/providers/<multihash>/<peerid>`:
+### Composing Datastores ###
+This datastore can be composed using mount datastores for optimized prefix queries under different namespaces and DynamoDB tables.
 
-* ddbds will write this into the main table with the following attributes:
-  * `Key`: `/providers/<multihash>/<peerid>`  (the main key)
-  * `ContentHash`: `<multihash>`  (the partition key of the `ProvidersQueryIndex` GSI)
-  * `PeerID`: `<peerid>`  (the sort key of the `ProvidersQueryIndex` GSI)
-  
-Since `ContentHash` and `PeerID` are the partition and sort keys of the `ProvidersQueryIndex` GSI, this entry will be populated into the GSI by DynamoDB, and will surface in queries such as `datastore.Query{Prefix: "/providers/<multihash>", Orders: []query.Order{&query.OrderByKeyDescending{}}}`:
+Example:
 
-* ddbds iterates through its list of `KeyTransforms` and finds that the prefix matches the transform for `ProvidersQueryIndex`
-* Since the index has a sort key, and the prefix includes the partition key, then ddbds will issue a DynamoDB Query
-  * GSI: `ProvidersQueryIndex`
-  * Partition Key: `ContentHash = <mulithash>`
-  * ScanIndexForward = false (for descending order)
-* DynamoDB returns all keys under `/providers/<multihash>` sorted descending by key
+```go
+ddbDS := mount.New([]mount.Mount{
+	{
+		Prefix: ds.NewKey("/peers/metadata"),
+		Datastore: ddbds.New(
+			ddbClient,
+			"datastore-peers-metadata",
+			ddbds.WithPartitionkey("PeerID"),
+			ddbds.WithSortKey("MetadataKey"),
+		),
+	},
+	{
+		Prefix: ds.NewKey("/peers/addrs"),
+		Datastore: ddbds.New(
+			ddbClient,
+			"datastore-peers-addrs",
+			ddbds.WithPartitionkey("PeerID"),
+		),
+	},
+	{
+		Prefix: ds.NewKey("/peers/keys"),
+		Datastore: ddbds.New(
+			ddbClient,
+			"datastore-peers-keys",
+			ddbds.WithPartitionkey("PeerID"),
+			ddbds.WithSortKey("KeyType"),
+		),
+	},
+	{
+		Prefix: ds.NewKey("/providers"),
+		Datastore: ddbds.New(
+			ddbClient,
+			"datastore-providers",
+			ddbds.WithPartitionkey("ContentHash"),
+			ddbds.WithSortKey("PeerID"),
+		),
+	},
+	{
+		Prefix: ds.NewKey("/"),
+		Datastore: ddbds.New(
+			ddbClient,
+			"datastore-all",
+			ddbds.WithPartitionkey("DSRootKey"),
+		),
+	},
+})
+```
 
-## Datastore Feature Support ##
+## Datastore Features ##
 
-### TTL ✓ ###
-ddbds implements the TTL datastore interface. To use this, you need to enable TTL support in your table and set the TTL field to `Expiration`. This field is auto-populated by ddbds and is the correct Unix epoch millisecond timestamp.
+* [x] Batching
+* [x] TTL
+* [ ] Transactions
+* [ ] Checked (not applicable)
+* [ ] Scrubbed (not applicable)
+* [ ] GC (not applicable)
+* [ ] Disk Usage
 
 
-### Transactions 🗴 ###
-ddbds does not implement the Txn interface for datastore transactions. This may be feasible, but would need more investigation. Since GSIs are eventually consistent, this may have limited utility.
-
-### Batching 🗴 ###
-ddbds uses naive batching and doesn't yet use DynamoDB batch operations. This is feasible to implement.
