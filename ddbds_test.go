@@ -250,6 +250,25 @@ func TestDDBDatastore_Batch(t *testing.T) {
 			expEntries: makeExpEntries(0, 200),
 		},
 		{
+			name:       "batch just under batch limit",
+			batches:    []batch{makeBatch(0, 24)},
+			expEntries: makeExpEntries(0, 24),
+		},
+		{
+			name:       "batch just over batch limit",
+			batches:    []batch{makeBatch(0, 26)},
+			expEntries: makeExpEntries(0, 26),
+		},
+		{
+			name:       "batch exactly equaling batch limit",
+			batches:    []batch{makeBatch(0, 25)},
+			expEntries: makeExpEntries(0, 25),
+		},
+		{
+			name:    "empty batch",
+			batches: []batch{},
+		},
+		{
 			name: "batch deletes work",
 			batches: []batch{
 				makeBatch(0, 100),
