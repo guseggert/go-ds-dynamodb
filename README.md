@@ -100,14 +100,38 @@ ddbDS := mount.New([]mount.Mount{
 })
 ```
 
+### IAM Permissions ###
+The following describes the IAM actions and the datastore methods that use them:
+
+* dynamodb:GetItem
+  * `Get()`
+  * `GetExpiration()`
+  * `GetSize()`
+  * `Has()`
+* dynamodb:PutItem
+  * `Put()`
+  * `PutWithTTL()`
+* dynamodb:DeleteItem
+  * `Delete()`
+* dynamodb:Scan
+  * `Scan()` (if there is no sort key defined)
+* dynamodb:Query
+  * `Query()` (if there is a sort key defined)
+* dynamodb:DescribeTable
+  * `DiskUsage()`
+* dynamodb:UpdateItem
+  * `SetTTL()`
+* dynamodb:BatchWriteItem
+  * `Batch.Commit()`
+
 ## Datastore Features ##
 
 * [x] Batching
 * [x] TTL
+* [x] Disk Usage
 * [ ] Transactions
 * [ ] Checked (not applicable)
 * [ ] Scrubbed (not applicable)
 * [ ] GC (not applicable)
-* [ ] Disk Usage
 
 
