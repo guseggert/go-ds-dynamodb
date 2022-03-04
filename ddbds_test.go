@@ -324,6 +324,46 @@ func TestDDBDatastore_Batch(t *testing.T) {
 	}
 }
 
+func TestDDBDatastore_DiskUsage(t *testing.T) {
+	ddbClient := newDDBClient(clientOpts{endpoint: "http://localhost:8000"})
+	stopDDBLocal, err := startDDBLocal(context.Background(), ddbClient)
+	t.Cleanup(stopDDBLocal)
+	require.NoError(t, err)
+
+	tbl := table{name: tableName, partitionKey: "key"}
+	setupTables(ddbClient, tbl)
+	defer cleanupTables(ddbClient, tbl)
+
+	ddbDS := &DDBDatastore{
+		ddbClient:    ddbClient,
+		table:        tableName,
+		partitionKey: "key",
+	}
+
+	ctx := context.Background()
+
+	t.Run("no items should have size == 0", func(t *testing.T) {
+		usage, err := ddbDS.DiskUsage(ctx)
+		require.NoError(t, err)
+		require.EqualValues(t, 0, usage)
+	})
+
+	t.Run("one item should have a size > 0", func(t *testing.T) {
+		err := ddbDS.Put(ctx, ds.NewKey("k1"), []byte("v1"))
+		require.NoError(t, err)
+		usage, err := ddbDS.DiskUsage(ctx)
+		require.NoError(t, err)
+		require.EqualValues(t, 0x28, usage)
+	})
+
+	t.Run("returns an error when there's an underlying DDB client error", func(t *testing.T) {
+		ddbDS.table = "non-existent-table"
+		_, err = ddbDS.DiskUsage(ctx)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "ResourceNotFoundException")
+	})
+}
+
 func TestDDBDatastore_PutAndGet(t *testing.T) {
 	ddbClient := newDDBClient(clientOpts{endpoint: "http://localhost:8000"})
 	stopDDBLocal, err := startDDBLocal(context.Background(), ddbClient)
@@ -394,16 +434,16 @@ func TestDDBDatastore_PutAndGet(t *testing.T) {
 	}
 }
 
-type queryResult struct {
-	entry query.Entry
-	err   string
-}
-
 func TestDDBDatastore_Query(t *testing.T) {
 	ddbClient := newDDBClient(clientOpts{endpoint: "http://localhost:8000"})
 	stopDDBLocal, err := startDDBLocal(context.Background(), ddbClient)
 	t.Cleanup(stopDDBLocal)
 	require.NoError(t, err)
+
+	type queryResult struct {
+		entry query.Entry
+		err   string
+	}
 
 	orderByKey := []query.Order{&query.OrderByKey{}}
 

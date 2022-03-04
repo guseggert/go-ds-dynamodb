@@ -77,6 +77,7 @@ func withDisableScans() func(o *Options) {
 
 var _ ds.Datastore = (*DDBDatastore)(nil)
 var _ ds.Batching = (*DDBDatastore)(nil)
+var _ ds.PersistentDatastore = (*DDBDatastore)(nil)
 
 func New(ddbClient *dynamodb.DynamoDB, table string, optFns ...func(o *Options)) *DDBDatastore {
 	opts := Options{}
@@ -426,4 +427,15 @@ func (d *DDBDatastore) GetExpiration(ctx context.Context, key ds.Key) (time.Time
 		return time.Time{}, err
 	}
 	return item.GetExpiration(), nil
+}
+
+// DiskUsage returns the size of the DynamoDB table.
+// Note that DynamoDB only updates this size once every few hours.
+// The underlying call is heavily throttled so this should only be called occasionally.
+func (d *DDBDatastore) DiskUsage(ctx context.Context) (uint64, error) {
+	res, err := d.ddbClient.DescribeTable(&dynamodb.DescribeTableInput{TableName: &d.table})
+	if err != nil {
+		return 0, err
+	}
+	return uint64(*res.Table.TableSizeBytes), nil
 }
