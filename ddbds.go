@@ -443,3 +443,11 @@ func (d *DDBDatastore) DiskUsage(ctx context.Context) (uint64, error) {
 	}
 	return uint64(*res.Table.TableSizeBytes), nil
 }
+
+func (d *DDBDatastore) EntryCount(ctx context.Context) (uint64, error) {
+	res, err := d.ddbClient.DescribeTable(&dynamodb.DescribeTableInput{TableName: &d.table})
+	if err != nil {
+		return 0, err
+	}
+	return uint64(*res.Table.ItemCount), nil
+}
