@@ -1,3 +1,5 @@
+**NOTE: This has been moved to [github.com/ipfs/go-ds-dynamodb](github.com/ipfs/go-ds-dynamodb/)**
+
 This is an implementation of [go-datastore](https://github.com/ipfs/go-datastore) that is backed by DynamoDB.
 
 ddbds includes support for optimized prefix queries. When you setup your table's key schema correctly and register it with ddbds, then incoming queries that match the schema will be converted into DynamoDB queries instead of table scans, enabling high performance, ordered, high-cardinality prefix queries.
